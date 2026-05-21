@@ -1,0 +1,4 @@
+Codex GitHub connector upload test.
+User: artiom-ar
+Project: AmneziaVPN Plus
+This file intentionally contains no source code, credentials, logs, build artifacts, or configuration secrets.
