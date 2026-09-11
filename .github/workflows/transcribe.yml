@@ -1,0 +1,106 @@
+name: Temporary lecture transcription
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Resolve and download public Yandex Disk file
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import requests
+          public='https://disk.yandex.ru/i/pH92BVR1Qa5rmQ'
+          api='https://cloud-api.yandex.net/v1/disk/public/resources/download'
+          r=requests.get(api, params={'public_key':public}, timeout=60)
+          r.raise_for_status()
+          href=r.json()['href']
+          print('Resolved Yandex download URL')
+          with requests.get(href, stream=True, timeout=120) as f:
+              f.raise_for_status()
+              with open('lesson.mov','wb') as out:
+                  for chunk in f.iter_content(1024*1024):
+                      if chunk: out.write(chunk)
+          PY
+          ls -lh lesson.mov
+
+      - name: Extract normalized speech audio
+        run: |
+          ffmpeg -hide_banner -loglevel error -y -i lesson.mov -vn -ac 1 -ar 16000 -c:a pcm_s16le lesson.wav
+          ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 lesson.wav
+
+      - name: Try shrybe free transcription first
+        id: shrybe
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import requests, urllib.parse
+          public='https://disk.yandex.ru/i/pH92BVR1Qa5rmQ'
+          api='https://cloud-api.yandex.net/v1/disk/public/resources/download'
+          href=requests.get(api, params={'public_key':public}, timeout=60).json()['href']
+          endpoint='https://api.shrybe.com/api/shortcut'
+          r=requests.get(endpoint, params={'language':'ru','url':href}, timeout=5400)
+          r.raise_for_status()
+          text=r.text.strip()
+          print('shrybe response chars:', len(text))
+          if len(text) < 3000 or 'error' in text[:500].lower() or 'couldn' in text[:500].lower():
+              raise RuntimeError('shrybe result missing/too short')
+          open('transcript.txt','w',encoding='utf-8').write(text+'\n')
+          PY
+
+      - name: Fallback to local faster-whisper small
+        if: steps.shrybe.outcome != 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet faster-whisper
+          cat > transcribe.py <<'PY'
+          from faster_whisper import WhisperModel
+          from pathlib import Path
+          model = WhisperModel('small', device='cpu', compute_type='int8', cpu_threads=4)
+          segments, info = model.transcribe(
+              'lesson.wav',
+              language='ru',
+              beam_size=5,
+              vad_filter=True,
+              vad_parameters=dict(min_silence_duration_ms=500),
+              condition_on_previous_text=True,
+          )
+          def ts(x):
+              x=int(round(x)); return f'{x//3600:02d}:{(x%3600)//60:02d}:{x%60:02d}'
+          lines=[]
+          for s in segments:
+              t=s.text.strip()
+              if t:
+                  lines.append(f'[{ts(s.start)}–{ts(s.end)}] {t}')
+          Path('transcript.txt').write_text('\n'.join(lines)+'\n', encoding='utf-8')
+          print('language', info.language, 'probability', info.language_probability)
+          print('segments', len(lines), 'chars', sum(map(len,lines)))
+          PY
+          python3 transcribe.py
+
+      - name: Verify transcript
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s transcript.txt
+          wc -l -c transcript.txt
+          echo '--- TRANSCRIPT BEGIN ---'
+          cat transcript.txt
+          echo '--- TRANSCRIPT END ---'
+
+      - name: Upload transcript artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lecture-transcript
+          path: transcript.txt
+          retention-days: 1
